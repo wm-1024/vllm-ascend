@@ -82,10 +82,6 @@ def lwd_init_channels() -> None:
     # device_group, whose creation order the framework guarantees. The
     # broadcast is issued on the compute stream at injection time, FIFO with
     # the forward TP collectives, so the two cannot interleave.
-    # This flag records that the channel groups EXIST (it guards init
-    # idempotency); it does NOT claim the warmup probe passed -- a probe
-    # failure raises inside lwd_warm_up_channels() and the process exits, so
-    # no runtime consumer can observe True-with-failed-probe.
     _LWD_CHANNELS_INITIALIZED = True
     logger.info(
         "[LWD] data-plane channels created for %s (my_rank=%d, endpoints=%s)",
@@ -166,10 +162,10 @@ def lwd_warm_up_channels() -> None:
 
     Each channel exchanges one identity probe frame over the existing
     isend/irecv round-trip in the fixed global order (connection order, UP
-    then DOWN, zero added P2P); the receiver bit-compares it against the
-    frame it derives from the same public facts.  Failures are aggregated
-    over the CPU/gloo world group so every rank raises with the same
-    verdict instead of hanging on the 1836s HCCL timeout; non-endpoint
+    then DOWN, zero added P2P); the receiver compares it field by field
+    against the frame it derives from the same public facts.  Failures are
+    aggregated over the CPU/gloo world group so every rank raises with the
+    same verdict instead of hanging on the 1836s HCCL timeout; non-endpoint
     ranks only join the aggregation and the closing barrier.
 
     Failure policy: a verify failure is recorded and probing continues --
@@ -184,42 +180,50 @@ def lwd_warm_up_channels() -> None:
     """
     failures: list[str] = []
     aborted = False
+    skipped: list[str] = []
     if _LWD_ENDPOINTS:
         my_rank = dist.get_rank()
-        for endpoints in _LWD_ENDPOINTS:
-            for channel in (LwdChannelType.UP, LwdChannelType.DOWN):
-                group, peer = _LWD_CHANNEL_GROUPS[(endpoints.dp_idx, channel)]
-                sender = endpoints.edge_rank if channel is LwdChannelType.UP else endpoints.cloud_rank
-                try:
-                    result = _lwd_probe_channel(group, peer, endpoints.dp_idx, channel, my_rank == sender)
-                except Exception as exc:
-                    # The state is unknown (OOM, broken NPU context, a
-                    # degraded backend): probing on it only manufactures
-                    # untraceable paths, so treat it like a TIMEOUT and stop
-                    # posting ops.  BaseException keeps propagating.
-                    failures.append(
-                        f"[dp_idx={endpoints.dp_idx} channel={channel.value}] "
-                        f"probe raised: {exc!r}"
-                    )
-                    aborted = True
-                    break
-                if result.outcome is _ProbeOutcome.OK:
-                    logger.info(
-                        "[LWD] data-plane warmup done: dp_idx=%d channel=%s my_rank=%d peer=%d",
-                        endpoints.dp_idx,
-                        channel,
-                        my_rank,
-                        peer,
-                    )
-                    continue
-                failures.append(result.detail)
-                if result.outcome is _ProbeOutcome.TIMEOUT:
-                    # The channel is wedged: the peer times out symmetrically,
-                    # so stop posting ops entirely.
-                    aborted = True
-                    break
-            if aborted:
+        planned = [
+            (endpoints, channel)
+            for endpoints in _LWD_ENDPOINTS
+            for channel in (LwdChannelType.UP, LwdChannelType.DOWN)
+        ]
+        for index, (endpoints, channel) in enumerate(planned):
+            group, peer = _LWD_CHANNEL_GROUPS[(endpoints.dp_idx, channel)]
+            sender = endpoints.edge_rank if channel is LwdChannelType.UP else endpoints.cloud_rank
+            try:
+                result = _lwd_probe_channel(group, peer, endpoints.dp_idx, channel, my_rank == sender)
+            except Exception as exc:
+                # The state is unknown (OOM, broken NPU context, a degraded
+                # backend): probing on it only manufactures untraceable
+                # paths, so treat it like a TIMEOUT and stop posting ops.
+                # BaseException keeps propagating.
+                failures.append(f"[dp_idx={endpoints.dp_idx} channel={channel.value}] probe raised: {exc!r}")
+                aborted = True
+                skipped = [f"dp{ep.dp_idx}/{ch.value}" for ep, ch in planned[index + 1 :]]
                 break
+            if result.outcome is _ProbeOutcome.OK:
+                logger.info(
+                    "[LWD] data-plane warmup done: dp_idx=%d channel=%s my_rank=%d peer=%d",
+                    endpoints.dp_idx,
+                    channel,
+                    my_rank,
+                    peer,
+                )
+                continue
+            failures.append(result.detail)
+            if result.outcome is _ProbeOutcome.TIMEOUT:
+                # The channel is wedged: the peer times out symmetrically,
+                # so stop posting ops entirely.
+                aborted = True
+                skipped = [f"dp{ep.dp_idx}/{ch.value}" for ep, ch in planned[index + 1 :]]
+                break
+    if skipped:
+        logger.warning(
+            "[LWD] channel probe aborted; %d channel(s) left unprobed: %s",
+            len(skipped),
+            ", ".join(skipped),
+        )
     # Verdict over the CPU/gloo group, never through the suspected HCCL
     # channels; every rank (endpoints and non-endpoints) must reach this.
     if not lwd_probe_aggregate(not failures, get_world_group().cpu_group):

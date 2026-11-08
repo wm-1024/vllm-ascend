@@ -13,15 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-"""Identity probe exchanged on the channel warmup round-trip.
+"""Identity probe carried by the channel warmup round-trip.
 
 Before any business payload flows, each channel's existing warmup
 isend/irecv carries one self-describing frame instead of zeros: the sender
 derives an 8-element bf16 frame from public facts only (its own global rank,
 the DP connection index, the channel direction), and the receiver
-independently rebuilds the expected frame and compares bit-exact.  A wrong
-peer, a crossed connection, a swapped direction or a corrupted / never-
-written buffer therefore fails loudly here, at init time, instead of
+independently rebuilds the expected frame and compares field by field.  A
+wrong peer, a crossed connection, a swapped direction or a corrupted /
+never-written buffer therefore fails loudly here, at init time, instead of
 surfacing as an ~1836 s HCCL hang on first business traffic.
 
 This module is deliberately a **leaf** next to ``lwd_payload_scrambler``: it
@@ -37,6 +37,7 @@ hccl_test matrix.
 
 from __future__ import annotations
 
+import math
 import time
 from typing import Any
 
@@ -54,11 +55,13 @@ __all__ = [
 ]
 
 # Fail-fast budget; public because the caller logs it in failure messages.
+# Far above a healthy rendezvous, with headroom for a temporarily degraded
+# link rather than a wedged one.
 LWD_PROBE_TIMEOUT_S = 30.0
 _LWD_PROBE_POLL_INTERVAL_S = 0.02
 
-# Frame layout: 8 bf16 elements, self-describing, size-invariant (the warmup
-# has always carried exactly this many elements).
+# Frame layout: 8 elements, self-describing, size-invariant (the warmup has
+# always carried exactly this many elements).
 _LWD_PROBE_FRAME_NUM_ELEMENTS = 8
 # bf16 represents every integer in [0, 256) exactly (8-bit significand), so
 # the frame crosses the wire losslessly; wider identities fail fast instead.
@@ -86,7 +89,12 @@ def lwd_probe_frame(
     channel: LwdChannelType,
     device: str | torch.device = "npu",
 ) -> torch.Tensor:
-    """The identity frame both peers derive from the same public facts."""
+    """The identity frame both peers derive from the same public facts.
+
+    Built as float32 on the CPU and cast down, so the values never depend on
+    how the target backend converts a Python integer list: bf16 exactness is
+    guaranteed by the range check, not by the backend.
+    """
     ch = 0 if channel is LwdChannelType.UP else 1
     assert 0 <= sender_rank < _LWD_PROBE_FIELD_LIMIT, f"sender_rank={sender_rank} out of range"
     assert 0 <= dp_idx < _LWD_PROBE_FIELD_LIMIT, f"dp_idx={dp_idx} out of range"
@@ -100,7 +108,8 @@ def lwd_probe_frame(
         (dp_idx * 7 + 11) % _LWD_PROBE_CHECKSUM_MOD,
         (ch * 13 + 17) % _LWD_PROBE_CHECKSUM_MOD,
     )
-    return torch.tensor(vals, dtype=torch.bfloat16, device=device)
+    frame = torch.tensor(vals, dtype=torch.float32).to(torch.bfloat16)
+    return frame.to(device)
 
 
 def lwd_probe_wait(handle: Any, timeout_s: float = LWD_PROBE_TIMEOUT_S) -> bool:
@@ -118,22 +127,42 @@ def lwd_probe_wait(handle: Any, timeout_s: float = LWD_PROBE_TIMEOUT_S) -> bool:
     return True
 
 
+def _lwd_probe_values(frame: torch.Tensor) -> list[int]:
+    """Frame fields as integers, read back through float32.
+
+    Non-finite entries (a corrupted buffer can carry NaN/Inf bit patterns)
+    collapse to -1, so a damaged frame is reported as MISMATCH instead of
+    raising: the caller must keep probing on MISMATCH to stay paired with
+    the peer, and an exception here would abort instead.
+    """
+    values: list[int] = []
+    for v in frame.to(torch.float32).tolist():
+        values.append(int(v) if math.isfinite(v) else -1)
+    return values
+
+
 def lwd_probe_verify(
     got: torch.Tensor,
     peer: int,
     dp_idx: int,
     channel: LwdChannelType,
 ) -> str:
-    """Bit-exact per-field compare on the receiver; "" = pass, else diagnosis."""
+    """Field-by-field compare on the receiver; "" = pass, else diagnosis.
+
+    Compared as integers on the CPU after a float32 upcast.  Never through
+    ``Tensor.view(dtype)``: the bit-view overload is not reliably available
+    on torch_npu, where it silently yields unusable values and makes the
+    frame mismatch on every run.
+    """
     if got.numel() != _LWD_PROBE_FRAME_NUM_ELEMENTS:
         return f"frame length mismatch: got {got.numel()} elements, expected {_LWD_PROBE_FRAME_NUM_ELEMENTS}"
     expected = lwd_probe_frame(peer, dp_idx, channel, device=str(got.device))
-    got_bits = got.view(torch.int16).tolist()
-    exp_bits = expected.view(torch.int16).tolist()
+    got_vals = _lwd_probe_values(got)
+    exp_vals = _lwd_probe_values(expected)
     problems = [
-        f"[{i}] {_LWD_PROBE_FIELD_NAMES[i]}: got {got_bits[i]}, expected {exp_bits[i]}"
+        f"[{i}] {_LWD_PROBE_FIELD_NAMES[i]}: got {got_vals[i]}, expected {exp_vals[i]}"
         for i in range(_LWD_PROBE_FRAME_NUM_ELEMENTS)
-        if got_bits[i] != exp_bits[i]
+        if got_vals[i] != exp_vals[i]
     ]
     return "; ".join(problems)
 
